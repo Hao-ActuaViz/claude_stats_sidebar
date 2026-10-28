@@ -44,7 +44,19 @@ terminal draws them in block characters.
    `CLAUDE_CODE_PLUGIN_DIR_WATCH` reloads the mod when its files change, so a `git pull` takes
    effect without a restart.
 
-3. Restart Claude Code, or quit and reopen the desktop app. The panel opens on its own. If you
+3. Copy the `/stats-panel` command file into your own commands:
+
+   ```bash
+   mkdir -p ~/.claude/commands && cp ~/.claude/mods/usage-stats/extras/stats-panel.md ~/.claude/commands/
+   ```
+
+   The desktop app stops a session's Claude Code when the session sits idle, and the mod only
+   registers `/stats-panel` once Claude Code runs again. Without this file, the app answers
+   "/stats-panel isn't a command here" until you send something else first. With it, the app
+   knows the command all along: the session starts, the mod answers it, and Claude never reads
+   the file. If the mod isn't loaded, the file has Claude tell you so.
+
+4. Restart Claude Code, or quit and reopen the desktop app. The panel opens on its own. If you
    close it, it stays closed in later sessions until you run `/stats-panel`.
 
 You need a Claude Code with mod support (built against 2.1.311) and `python3` on your `PATH`.
@@ -89,5 +101,7 @@ claude plugin test .
 | `scripts/scan_transcripts.py` | The transcript counter |
 | `types/index.d.ts` | The mod's state |
 | `tests/usage-stats.test.tsx` | Tests |
+| `extras/stats-panel.md` | The `/stats-panel` command file to copy into `~/.claude/commands` |
 
-Claude Code writes `.claude-plugin/types/` itself, and it stays out of git.
+Claude Code writes `.claude-plugin/types/` itself, and it stays out of git. The command file sits
+in `extras/`, not `commands/`, so Claude Code doesn't also load it as one of the mod's own commands.
