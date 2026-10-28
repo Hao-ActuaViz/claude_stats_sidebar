@@ -2,5 +2,6 @@
   "name": "usage-stats",
   "version": "0.1.0",
   "description": "A Stats panel beside the chat: a calendar heatmap of your daily Claude Code activity, plus streaks, sessions and tokens by model",
+  "license": "MIT",
   "types": "./types/index.d.ts"
 }
