@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { On } from 'claude-code'
+import type { CommandInfo, On } from 'claude-code'
 
 import {
   buildCalendar,
@@ -64,10 +64,18 @@ const PANE = {
 
 type Scan = { exitCode: number; stdout: string; stderr: string }
 
-/** The engine beneath the plugin: the stats cache, the scan script, a store, and the panes it opened. */
-function world(on: On, options: { store?: Record<string, unknown>; scan?: Scan } = {}) {
+/**
+ * The engine beneath the plugin: the stats cache, the scan script, a store, the
+ * person's own commands, and the panes and commands the plugin added.
+ */
+function world(
+  on: On,
+  options: { store?: Record<string, unknown>; scan?: Scan; commands?: CommandInfo[] } = {},
+) {
   const scans: string[][] = []
   const opened: string[] = []
+  const registered: string[] = []
+  const commands = options.commands ?? []
   const clock = mock.clock(on, { now: NOW })
   mock.store(on, options.store ?? {})
   mock.env(on, { HOME: '/home/test' })
@@ -78,7 +86,15 @@ function world(on: On, options: { store?: Record<string, unknown>; scan?: Scan }
     const result = options.scan ?? { exitCode: 0, stdout: JSON.stringify(SCAN), stderr: '' }
     return { value: { ...result, isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  on('command.register', () => ({ value: { command: 'stats-panel' } }))
+  on('command.list', () => ({ value: commands }))
+  // As Claude Code does, the name of one of the person's own commands is refused.
+  on('command.register', (_, e) => {
+    if (commands.some(command => command.name === e.name && command.source !== 'plugin')) {
+      throw new Error(`"/${e.name}" refused: it is the user's /${e.name}`)
+    }
+    registered.push(e.name)
+    return { value: { command: e.name } }
+  })
   on('ui.open', (_, e) => {
     opened.push(e.id)
     return { value: { isPlaced: true } }
@@ -87,7 +103,7 @@ function world(on: On, options: { store?: Record<string, unknown>; scan?: Scan }
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
 
-  return { scans, opened, clock }
+  return { scans, opened, registered, clock }
 }
 
 test('the summary adds up each range', async () => {
@@ -209,8 +225,9 @@ test('the token chart stacks each day by model and pages through the range', asy
 })
 
 test('the panel draws live counts on every surface', async ($, on) => {
-  const { scans, opened } = world(on)
+  const { scans, opened, registered } = world(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(registered).toEqual(['stats-panel'])
   expect(opened).toEqual(['usage-stats'])
   await $.command.run({ command: 'stats-panel' })
   expect(scans.at(-1)).toEqual([
@@ -295,6 +312,20 @@ test('the panel draws live counts on every surface', async ($, on) => {
     await ui.press({ key: 'range-all' })
     await ui.unmount()
   }
+})
+
+test("the person's own /stats-panel keeps the name, and the session still counts and opens", async ($, on) => {
+  const { scans, opened, registered, clock } = world(on, {
+    commands: [{ name: 'stats-panel', description: 'Open the Stats panel', source: 'user' }],
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect(registered).toEqual([])
+  expect(opened).toEqual(['usage-stats'])
+  expect(scans.length).toBe(1)
+
+  // The file's command runs through the mod's hook, so the file's text never reaches Claude.
+  expect((await $.command.run({ command: 'stats-panel' })).text).toBe('Stats panel opened.')
 })
 
 test('a turn ends, and the transcripts are counted again', async ($, on) => {

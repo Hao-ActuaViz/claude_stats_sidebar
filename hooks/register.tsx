@@ -142,12 +142,22 @@ function refreshSoon($: EngineInterface) {
   })
 }
 
+// The command file the README installs in ~/.claude/commands names /stats-panel
+// first, and Claude Code refuses the name to a plugin then; the command.run hook
+// answers that file's command all the same.
+async function registerCommand($: EngineInterface) {
+  const commands = await $.command.list()
+  if (commands.some(command => command.name === 'stats-panel' && command.source !== 'plugin')) return
+  await $.command.register({
+    name: 'stats-panel',
+    description: 'Open the Stats panel: your activity heatmap, streaks and tokens by model',
+  })
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({
-      name: 'stats-panel',
-      description: 'Open the Stats panel: your activity heatmap, streaks and tokens by model',
-    })
+    // Without the command, the panel still counts and opens.
+    await registerCommand($).catch(() => undefined)
     // A background refresh cut short by a reload has nobody left to tell.
     refresh($).catch(() => undefined)
     $.clock.every(REFRESH_MS, () => void refresh($).catch(() => undefined))
