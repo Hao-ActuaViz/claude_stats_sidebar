@@ -5,7 +5,14 @@ export type DailyActivity = {
   toolCallCount: number
 }
 
-export type DailyModelTokens = { date: string; tokensByModel: Record<string, number> }
+export type DailyModelTokens = {
+  date: string
+  tokensByModel: Record<string, number>
+  /** Some of the day's sessions were deleted: their tokens come from the cache, scaled to one count a reply. */
+  isEstimated?: boolean
+  /** Requests only Headroom logged, which no transcript holds: auto mode's safety checks, compaction, titles. */
+  hiddenCalls?: number
+}
 
 /** Claude Code's own `stats-cache.json`, merged with the transcripts' later days. */
 export type UsageStats = {

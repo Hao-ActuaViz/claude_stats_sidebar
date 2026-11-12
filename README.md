@@ -63,14 +63,30 @@ You need a Claude Code with mod support (built against 2.1.311) and `python3` on
 
 ## How it counts
 
-- Days up to the last one in `~/.claude/stats-cache.json` come from that file. Claude Code no
-  longer updates it.
-- Later days come from your transcripts in `~/.claude/projects`, counted by
-  `scripts/scan_transcripts.py`. The script keeps per-file counts in
-  `~/.cache/claude-usage-stats/scan-state.json`, so it only rereads files that changed.
+- Your transcripts in `~/.claude/projects` are counted by `scripts/scan_transcripts.py`. The
+  script keeps per-file counts in `~/.cache/claude-usage-stats/scan-state.json`, so it only
+  rereads files that changed.
 - It counts when a session starts, every 2 minutes, and 2 seconds after each turn.
-- A message is a user, assistant, attachment or system line. A reply's tokens count once, and
-  include prompt-cache reads. A session counts on the day it started.
+- A message is a user, assistant, attachment or system line, as Claude Code's own `/stats` counted
+  them. Claude Code writes a reply as a line per content block, so most messages are tool calls,
+  tool results, attachments and thinking, not prompts you typed. A session counts on the day it
+  started.
+- A line or a reply counts once, though a forked or resumed session starts its transcript with a
+  copy of its parent's.
+- A reply's tokens count once, and include prompt-cache reads. Claude Code's
+  `~/.claude/stats-cache.json` counted them once per line of the reply, about twice over.
+- Claude Code no longer updates that cache, and deletes old transcripts. For days through the
+  cache's last, whatever the cache counted beyond the transcripts still on disk comes from
+  sessions deleted since: their messages are added, and their tokens too, scaled down to once a
+  reply. A day like that says "Partly estimated" on the token chart.
+- Some requests never reach a transcript: auto mode's safety checks (on Sonnet), compaction
+  summaries, session titles. If you send Claude Code through a Headroom proxy, the script reads
+  its logs in `~/.headroom/logs` and counts each request that matches no reply in your
+  transcripts. It reads only the counts Headroom copies from the API's response (cache reads,
+  cache writes, output tokens), and keeps those requests after the logs rotate. Without Headroom,
+  these requests aren't counted.
+- Cowork sessions, claude.ai chats and sessions on other machines leave no transcript here, so they
+  aren't counted.
 - `CLAUDE_CONFIG_DIR` is respected in place of `~/.claude`.
 
 Everything stays on your machine: the mod reads local files and runs a local script, nothing more.
@@ -93,6 +109,10 @@ claude plugin validate .
 claude plugin test .
 ```
 
+```bash
+python3 -m unittest discover -s tests
+```
+
 | Path | What it holds |
 |---|---|
 | `.claude-plugin/plugin.json` | The mod's manifest |
@@ -100,7 +120,8 @@ claude plugin test .
 | `hooks/stats.ts` | Counting, merging, and drawing the charts |
 | `scripts/scan_transcripts.py` | The transcript counter |
 | `types/index.d.ts` | The mod's state |
-| `tests/usage-stats.test.tsx` | Tests |
+| `tests/usage-stats.test.tsx` | The mod's tests |
+| `tests/test_scan_transcripts.py` | The transcript counter's tests |
 | `extras/stats-panel.md` | The `/stats-panel` command file to copy into `~/.claude/commands` |
 
 Claude Code writes `.claude-plugin/types/` itself, and it stays out of git. The command file sits
