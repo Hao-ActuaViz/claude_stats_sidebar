@@ -79,6 +79,8 @@ async function readCache($: EngineInterface): Promise<UsageStats | null> {
 }
 
 // Transcripts can pass the 4 MiB a mod reads at once, so a script counts them.
+// Where Headroom proxies the API, its logs show the requests no transcript
+// holds; the script skips the folder when it isn't there.
 async function scanTranscripts($: EngineInterface): Promise<TranscriptScan> {
   const home = (await $.env.get('HOME')) ?? ''
   const { exitCode, stdout, stderr } = await $.process.run(
@@ -88,6 +90,7 @@ async function scanTranscripts($: EngineInterface): Promise<TranscriptScan> {
       `${$.plugin.root}/scripts/scan_transcripts.py`,
       `${await configDir($)}/projects`,
       `${home}/.cache/claude-usage-stats/scan-state.json`,
+      `${home}/.headroom/logs`,
     ],
     { timeoutMs: 120_000 },
   )
@@ -299,6 +302,9 @@ export const register: Register = on => {
               )}
               <Text dimColor size="caption">
                 Tokens per day{maxDaysBack > 0 ? '' : `, ${span}`}, {freshness}. Tokens include prompt-cache reads.
+                {summary.hiddenCalls > 0
+                  ? ` They include ${plural(summary.hiddenCalls, 'request')} only Headroom logged, such as auto mode's safety checks.`
+                  : ''}
               </Text>
             </Box>
           )}

@@ -34,14 +34,32 @@ const CACHE = {
   hourCounts: { '10': 3, '15': 9 },
 }
 
-// What scripts/scan_transcripts.py prints: Oct 21 again (the cache keeps its
-// activity, the transcripts' tokens win) and Oct 22, which only it has.
+// What scripts/scan_transcripts.py prints. The cache counts a reply's tokens
+// twice here (once per line), and:
+// - Oct 19: the cache saved the day partway through; the transcripts have more.
+// - Oct 20: every transcript was deleted since; only the cache has the day.
+// - Oct 21: one session was deleted, a fork copied 10 lines of another, and
+//   Headroom logged 3 safety checks no transcript holds.
+// - Oct 22: after the cache's last day.
+const day = (messages: number, toolCalls: number, tokens: Record<string, number>, perLine: Record<string, number>) => ({
+  messages,
+  sessions: 1,
+  toolCalls,
+  tokens,
+  asCached: { messages, toolCalls, tokens: perLine },
+})
 const SCAN = {
   days: {
-    '2026-10-21': { messages: 290, sessions: 1, toolCalls: 38, tokens: { 'claude-opus-5-5': 2500 } },
-    '2026-10-22': { messages: 50, sessions: 1, toolCalls: 5, tokens: { 'claude-opus-5-5': 2000 } },
+    '2026-10-19': { ...day(120, 25, {}, {}), sessions: 2 },
+    '2026-10-21': {
+      ...day(280, 38, { 'claude-opus-5-5': 2500 }, { 'claude-opus-5-5': 5000 }),
+      asCached: { messages: 290, toolCalls: 40, tokens: { 'claude-opus-5-5': 5000 } },
+      hidden: { calls: 3, tokens: { 'claude-sonnet-5': 900 } },
+    },
+    '2026-10-22': day(50, 5, { 'claude-opus-5-5': 2000 }, { 'claude-opus-5-5': 4000 }),
   },
   sessionHours: { '2026-10-21': { '15': 1 }, '2026-10-22': { '9': 1 } },
+  lineRatio: 2,
 }
 
 // Noon UTC on Thursday, Oct 22: the same local date in nearly every zone.
@@ -132,34 +150,56 @@ test('the summary adds up each range', async () => {
   expect(funFact(1000)).toBeNull()
 })
 
-test('the merge keeps the cache through its last day and counts tokens from the transcripts', async () => {
+test('the merge counts the transcripts, and puts back what the cache saw in deleted ones', async () => {
   const cache = parseStatsCache(JSON.stringify(CACHE))
   const merged = mergeStats(cache, parseTranscriptScan(JSON.stringify(SCAN)), TODAY, NOW)
 
   expect(merged.computedThrough).toBe(TODAY)
   expect(merged.updatedAt).toBe(NOW)
+  // Oct 19: the transcripts' 120, not the cache's 100. Oct 20: the cache's
+  // 200. Oct 21: the transcripts' 280, without the fork's copies, and the
+  // deleted session's 10 that only the cache saw.
   expect(merged.daily.map(d => [d.date, d.messageCount])).toEqual([
     ['2026-10-14', 40],
-    ['2026-10-19', 100],
+    ['2026-10-19', 120],
     ['2026-10-20', 200],
-    ['2026-10-21', 300],
+    ['2026-10-21', 290],
     ['2026-10-22', 50],
   ])
-  expect(merged.dailyTokens.find(row => row.date === '2026-10-21')?.tokensByModel).toEqual({
-    'claude-opus-5-5': 2500,
-  })
-  expect(merged.dailyTokens.find(row => row.date === '2026-10-20')?.tokensByModel).toEqual(
-    CACHE.dailyModelTokens[0]!.tokensByModel,
-  )
+  expect(merged.daily.find(d => d.date === '2026-10-21')?.toolCallCount).toBe(38)
+  // The cache's tokens for deleted sessions, halved to once a reply.
+  expect(merged.dailyTokens).toEqual([
+    {
+      date: '2026-10-20',
+      tokensByModel: { 'claude-opus-5-5': 1500, 'claude-haiku-4-5-20251001': 500 },
+      isEstimated: true,
+    },
+    {
+      date: '2026-10-21',
+      tokensByModel: { 'claude-opus-5-5': 3000, 'claude-sonnet-5': 900 },
+      isEstimated: true,
+      hiddenCalls: 3,
+    },
+    { date: '2026-10-22', tokensByModel: { 'claude-opus-5-5': 2000 } },
+  ])
   expect(merged.hourCounts).toEqual({ '9': 1, '10': 3, '15': 9 })
 
   const all = summarize(merged, 'all', TODAY)
-  expect(all.messages).toBe(690)
+  expect(all.messages).toBe(700)
   expect(all.sessions).toBe(8)
+  expect(all.tokens).toBe(7900)
+  expect(all.hiddenCalls).toBe(3)
   expect(all.currentStreak).toBe(4)
 
+  // A deleted session Headroom also logged is counted once, by the larger of the two.
+  const both = parseTranscriptScan(JSON.stringify(SCAN))
+  both.days['2026-10-21']!.hidden.tokens['claude-opus-5-5'] = 800
+  expect(mergeStats(cache, both, TODAY, NOW).dailyTokens[1]).toMatchObject({
+    tokensByModel: { 'claude-opus-5-5': 3300 },
+  })
+
   // Nothing yet today: a streak that reached yesterday is still alive.
-  const quiet = mergeStats(cache, { days: {}, sessionHours: {} }, TODAY, NOW)
+  const quiet = mergeStats(cache, { days: {}, sessionHours: {}, lineRatio: 2 }, TODAY, NOW)
   expect(summarize(quiet, 'all', TODAY).currentStreak).toBe(3)
   expect(buildCalendar(quiet, TODAY, 1).weeks[0]?.[4]).toMatchObject({ date: TODAY, isPending: false })
 })
@@ -188,15 +228,20 @@ test('the token chart stacks each day by model and pages through the range', asy
     '2026-10-21',
     '2026-10-22',
   ])
-  expect(chart.max).toBe(4000)
+  expect(chart.max).toBe(3900)
   // Opus, with the most tokens of all time, has Claude's orange at the bottom.
   expect(chart.days[2]).toMatchObject({
-    total: 4000,
+    total: 2000,
     segments: [
-      { color: '#d77757', tokens: 3000 },
-      { color: '#3987e5', tokens: 1000 },
+      { color: '#d77757', tokens: 1500 },
+      { color: '#199e70', tokens: 500 },
     ],
+    isEstimated: true,
   })
+  expect(chart.days[3]?.segments).toEqual([
+    { color: '#d77757', tokens: 3000 },
+    { color: '#3987e5', tokens: 900 },
+  ])
   expect(chart.days[1]).toMatchObject({ total: 0, segments: [], models: [] })
 
   // Four days back, it stops where the range starts.
@@ -208,7 +253,7 @@ test('the token chart stacks each day by model and pages through the range', asy
     '2026-10-17',
     '2026-10-18',
   ])
-  expect(earlier.max).toBe(4000)
+  expect(earlier.max).toBe(3900)
 
   // Past five models, the rest share one gray segment on top.
   const many = {
@@ -236,13 +281,14 @@ test('the panel draws live counts on every surface', async ($, on) => {
     expect.stringMatching(/\/scripts\/scan_transcripts\.py$/),
     '/home/test/.claude/projects',
     '/home/test/.cache/claude-usage-stats/scan-state.json',
+    '/home/test/.headroom/logs',
   ])
 
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
 
     expect(await ui.find({ type: 'Text', text: /^Favorite model$/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /^690$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^700$/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /^4 days$/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /updated \d\d:\d\d/ })).toBeDefined()
 
@@ -293,6 +339,7 @@ test('the panel draws live counts on every surface', async ($, on) => {
     expect(
       await ui.find({ type: 'Text', text: /^Tokens per day, Oct 16 – Oct 22, 2026, updated \d\d:\d\d\./ }),
     ).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /include 3 requests only Headroom logged/ })).toBeDefined()
     if (surface === 'terminal') {
       // Two columns a day beside the axis, eight rows of bars over the dates.
       const bars = await ui.find({ type: 'Raster', key: 'tokens' })
@@ -302,10 +349,12 @@ test('the panel draws live counts on every surface', async ($, on) => {
       // A hover column a day, each with its tooltip; Oct 20 stacks Haiku on Opus.
       expect(bars.match(/<g class="c" id="c\d+">/g)?.length).toBe(7)
       expect(bars.match(/#c\d+:hover~#t\d+\{display:inline\}/g)?.length).toBe(7)
-      expect(bars).toMatch(/<g class="c" id="c4">.*?<rect fill="#d77757"[^>]*\/><path fill="#3987e5"/)
+      expect(bars).toMatch(/<g class="c" id="c4">.*?<rect fill="#d77757"[^>]*\/><path fill="#199e70"/)
       expect(bars).toContain('<tspan>Thu, Oct 22, 2026</tspan><tspan x="')
       expect(bars).toContain('>2k tokens</tspan>')
-      expect(bars).toContain('>Haiku 4.5 · 1k</tspan>')
+      expect(bars).toContain('>Haiku 4.5 · 500</tspan>')
+      expect(bars).toContain('>Sonnet 5 · 900</tspan>')
+      expect(bars.match(/>Partly estimated: some sessions were deleted<\/tspan>/g)?.length).toBe(2)
       expect(bars).toContain('>No tokens</tspan>')
     }
     await ui.press({ key: 'tab-overview' })

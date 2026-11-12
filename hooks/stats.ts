@@ -29,6 +29,8 @@ export type Summary = {
   toolCalls: number
   tokens: number
   models: { name: string; tokens: number }[]
+  /** Requests only Headroom logged, counted in `tokens`. */
+  hiddenCalls: number
   activeDays: number
   spanDays: number
   currentStreak: number
@@ -102,16 +104,31 @@ export function parseStatsCache(text: string): UsageStats {
 }
 
 export type TranscriptDay = {
+  /** Each line once over all the transcripts, though forks copy their parent's. */
   messages: number
   sessions: number
   toolCalls: number
+  /** Each reply's tokens once. */
   tokens: Record<string, number>
+  /** The same transcripts as Claude Code's cache counts them: each file on its own, tokens once per line. */
+  asCached: { messages: number; toolCalls: number; tokens: Record<string, number> }
+  /** Requests Headroom logged that match no reply in the transcripts. */
+  hidden: { calls: number; tokens: Record<string, number> }
 }
 
 /** What scripts/scan_transcripts.py prints: counts per local day. */
 export type TranscriptScan = {
   days: Record<string, TranscriptDay>
   sessionHours: Record<string, Record<string, number>>
+  /** How many lines' worth of tokens the cache counts for each reply. */
+  lineRatio: number
+}
+
+function counts(value: unknown): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const [key, n] of Object.entries((value ?? {}) as Record<string, unknown>)) out[key] = count(n)
+
+  return out
 }
 
 export function parseTranscriptScan(text: string): TranscriptScan {
@@ -119,30 +136,49 @@ export function parseTranscriptScan(text: string): TranscriptScan {
   const days: Record<string, TranscriptDay> = {}
   for (const [date, value] of Object.entries((raw.days ?? {}) as Record<string, Record<string, unknown>>)) {
     if (!isDate(date)) continue
-    const tokens: Record<string, number> = {}
-    for (const [model, n] of Object.entries((value.tokens ?? {}) as Record<string, unknown>)) tokens[model] = count(n)
+    const tokens = counts(value.tokens)
+    const cached = (value.asCached ?? {}) as Record<string, unknown>
+    const hidden = (value.hidden ?? {}) as Record<string, unknown>
     days[date] = {
       messages: count(value.messages),
       sessions: count(value.sessions),
       toolCalls: count(value.toolCalls),
       tokens,
+      asCached: {
+        messages: count(cached.messages),
+        toolCalls: count(cached.toolCalls),
+        tokens: counts(cached.tokens),
+      },
+      hidden: { calls: count(hidden.calls), tokens: counts(hidden.tokens) },
     }
   }
   const sessionHours: Record<string, Record<string, number>> = {}
   for (const [date, hours] of Object.entries((raw.sessionHours ?? {}) as Record<string, Record<string, unknown>>)) {
     if (!isDate(date)) continue
-    sessionHours[date] = {}
-    for (const [hour, n] of Object.entries(hours)) sessionHours[date][hour] = count(n)
+    sessionHours[date] = counts(hours)
   }
+  const ratio = count(raw.lineRatio)
 
-  return { days, sessionHours }
+  return { days, sessionHours, lineRatio: ratio >= 1 ? ratio : 1 }
+}
+
+const NO_DAY: TranscriptDay = {
+  messages: 0,
+  sessions: 0,
+  toolCalls: 0,
+  tokens: {},
+  asCached: { messages: 0, toolCalls: 0, tokens: {} },
+  hidden: { calls: 0, tokens: {} },
 }
 
 /**
- * The cache's activity through its last day, the transcripts' after it.
+ * The transcripts' counts, with what they no longer hold put back.
  *
- * Tokens come from the transcripts wherever they have the day, since they
- * count a reply once and the cache counts it once per line of the reply.
+ * Through its last day, the cache counted files since deleted: whatever it
+ * has over the same transcripts counted its way is theirs. Its tokens count a
+ * reply once per line, so theirs are scaled to once a reply, an estimate.
+ * Requests only Headroom logged count too; where both stand for a model's
+ * missing tokens, the larger does, as deleted sessions can be in both.
  */
 export function mergeStats(
   cache: UsageStats | null,
@@ -151,22 +187,45 @@ export function mergeStats(
   updatedAt: number,
 ): UsageStats {
   const through = cache?.computedThrough ?? ''
-  const daily = new Map<string, DailyActivity>()
-  for (const row of cache?.daily ?? []) if (row.date <= through) daily.set(row.date, row)
-  for (const [date, day] of Object.entries(scan.days)) {
-    if (date <= through || date > today) continue
-    daily.set(date, {
-      date,
-      messageCount: day.messages,
-      sessionCount: day.sessions,
-      toolCallCount: day.toolCalls,
-    })
-  }
+  const cachedDays = new Map((cache?.daily ?? []).filter(row => row.date <= through).map(row => [row.date, row]))
+  const cachedTokens = new Map(
+    (cache?.dailyTokens ?? []).filter(row => row.date <= through).map(row => [row.date, row.tokensByModel]),
+  )
+  const dates = [...new Set([...cachedDays.keys(), ...cachedTokens.keys(), ...Object.keys(scan.days)])]
+    .filter(date => date <= today)
+    .sort()
+  const gone = (cached: number | undefined, counted: number) => Math.max(0, (cached ?? 0) - counted)
 
-  const tokens = new Map<string, Record<string, number>>()
-  for (const row of cache?.dailyTokens ?? []) tokens.set(row.date, row.tokensByModel)
-  for (const [date, day] of Object.entries(scan.days)) {
-    if (date <= today && Object.keys(day.tokens).length > 0) tokens.set(date, day.tokens)
+  const daily: DailyActivity[] = []
+  const dailyTokens: UsageStats['dailyTokens'] = []
+  for (const date of dates) {
+    const day = scan.days[date] ?? NO_DAY
+    const cachedDay = cachedDays.get(date)
+    if (cachedDay || scan.days[date]) {
+      daily.push({
+        date,
+        messageCount: day.messages + gone(cachedDay?.messageCount, day.asCached.messages),
+        sessionCount: Math.max(day.sessions, cachedDay?.sessionCount ?? 0),
+        toolCallCount: day.toolCalls + gone(cachedDay?.toolCallCount, day.asCached.toolCalls),
+      })
+    }
+
+    const cached = cachedTokens.get(date) ?? {}
+    const tokensByModel: Record<string, number> = {}
+    let isEstimated = false
+    for (const model of new Set([...Object.keys(cached), ...Object.keys(day.tokens), ...Object.keys(day.hidden.tokens)])) {
+      const deleted = gone(cached[model], day.asCached.tokens[model] ?? 0) / scan.lineRatio
+      const hidden = day.hidden.tokens[model] ?? 0
+      if (deleted > hidden) isEstimated = true
+      const tokens = (day.tokens[model] ?? 0) + Math.round(Math.max(deleted, hidden))
+      if (tokens > 0) tokensByModel[model] = tokens
+    }
+    if (Object.keys(tokensByModel).length > 0) {
+      const row: UsageStats['dailyTokens'][number] = { date, tokensByModel }
+      if (isEstimated) row.isEstimated = true
+      if (day.hidden.calls > 0) row.hiddenCalls = day.hidden.calls
+      dailyTokens.push(row)
+    }
   }
 
   const hourCounts = { ...cache?.hourCounts }
@@ -184,10 +243,8 @@ export function mergeStats(
     updatedAt,
     firstDay: firsts.sort()[0] ?? null,
     hourCounts,
-    daily: [...daily.values()].sort((a, b) => a.date.localeCompare(b.date)),
-    dailyTokens: [...tokens]
-      .map(([date, tokensByModel]) => ({ date, tokensByModel }))
-      .sort((a, b) => a.date.localeCompare(b.date)),
+    daily,
+    dailyTokens,
   }
 }
 
@@ -216,8 +273,10 @@ export function summarize(stats: UsageStats, range: StatsRange, today: string): 
   const active = days.filter(d => d.messageCount > 0)
 
   const byModel = new Map<string, number>()
+  let hiddenCalls = 0
   for (const row of stats.dailyTokens) {
     if (row.date < from || row.date > today) continue
+    hiddenCalls += row.hiddenCalls ?? 0
     for (const [model, tokens] of Object.entries(row.tokensByModel)) {
       byModel.set(model, (byModel.get(model) ?? 0) + tokens)
     }
@@ -248,6 +307,7 @@ export function summarize(stats: UsageStats, range: StatsRange, today: string): 
     toolCalls: days.reduce((n, d) => n + d.toolCallCount, 0),
     tokens: models.reduce((n, m) => n + m.tokens, 0),
     models,
+    hiddenCalls,
     activeDays: active.length,
     spanDays: Math.max(1, dayNumber(today) - dayNumber(from) + 1),
     currentStreak,
@@ -582,6 +642,8 @@ export type TokenDay = {
   /** The day's models, most tokens first, for its tooltip. */
   models: { name: string; tokens: number; color: string }[]
   isPending: boolean
+  /** Some of the day's sessions were deleted, so its tokens are partly estimated. */
+  isEstimated: boolean
 }
 
 export type TokenChart = {
@@ -618,13 +680,14 @@ export function buildTokenChart(
 ): TokenChart {
   const colors = modelColors(stats)
   const slots = [...colors.values(), OTHER_COLOR]
-  const byDate = new Map(stats.dailyTokens.map(row => [row.date, row.tokensByModel]))
+  const byDate = new Map(stats.dailyTokens.map(row => [row.date, row]))
   const from = rangeStart(stats, range, today)
   const through = dayNumber(stats.computedThrough)
 
   const dayOf = (day: number): TokenDay => {
     const date = dateOf(day)
-    const models = Object.entries(byDate.get(date) ?? {})
+    const row = byDate.get(date)
+    const models = Object.entries(row?.tokensByModel ?? {})
       .filter(([, tokens]) => tokens > 0)
       .map(([name, tokens]) => ({ name, tokens, color: colorOf(colors, name) }))
       .sort((a, b) => b.tokens - a.tokens)
@@ -632,7 +695,14 @@ export function buildTokenChart(
       .map(color => ({ color, tokens: models.filter(m => m.color === color).reduce((n, m) => n + m.tokens, 0) }))
       .filter(segment => segment.tokens > 0)
 
-    return { date, total: models.reduce((n, m) => n + m.tokens, 0), segments, models, isPending: day > through }
+    return {
+      date,
+      total: models.reduce((n, m) => n + m.tokens, 0),
+      segments,
+      models,
+      isPending: day > through,
+      isEstimated: row?.isEstimated === true,
+    }
   }
 
   const max = Math.max(
@@ -698,6 +768,7 @@ function tokenTip(day: TokenDay, computedThrough: string): TipLine[] {
     when,
     { text: `${compact(day.total)} tokens` },
     ...day.models.map(model => ({ text: `${modelLabel(model.name)} · ${compact(model.tokens)}`, swatch: model.color })),
+    ...(day.isEstimated ? [{ text: 'Partly estimated: some sessions were deleted' }] : []),
   ]
 }
 
